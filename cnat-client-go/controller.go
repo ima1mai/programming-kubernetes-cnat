@@ -66,7 +66,7 @@ type Controller struct {
 	// kubeclientset is a standard kubernetes clientset
 	kubeclientset kubernetes.Interface
 	// sampleclientset is a clientset for our own API group
-	sampleclientset clientset.Interface
+	cnatClientset clientset.Interface
 
 	atLister   listers.AtLister
 	atsSynced  cache.InformerSynced
@@ -87,7 +87,7 @@ type Controller struct {
 // NewController returns a new sample controller
 func NewController(
 	kubeclientset kubernetes.Interface,
-	sampleclientset clientset.Interface,
+	cnatClientset clientset.Interface,
 	atInformer informers.AtInformer,
 	podInformer corev1informer.PodInformer) *Controller {
 
@@ -102,14 +102,14 @@ func NewController(
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
 
 	controller := &Controller{
-		kubeclientset:   kubeclientset,
-		sampleclientset: sampleclientset,
-		atLister:        atInformer.Lister(),
-		atsSynced:       atInformer.Informer().HasSynced,
-		podLister:       podInformer.Lister(),
-		podsSynced:      podInformer.Informer().HasSynced,
-		workqueue:       workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Foos"),
-		recorder:        recorder,
+		kubeclientset: kubeclientset,
+		cnatClientset: cnatClientset,
+		atLister:      atInformer.Lister(),
+		atsSynced:     atInformer.Informer().HasSynced,
+		podLister:     podInformer.Lister(),
+		podsSynced:    podInformer.Informer().HasSynced,
+		workqueue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Foos"),
+		recorder:      recorder,
 	}
 
 	klog.Info("Setting up event handlers")
@@ -295,9 +295,9 @@ func (c *Controller) syncHandler(key string) (time.Duration, error) {
 
 		// Try to see if the pod already exists and if not
 		// (which we expect) then create a one-shot pod as per spec:
-		found, err := c.kubeClientset.CoreV1.Pods(pod.Namespace).Get(pod.Name, metav1.GetOptions{})
+		found, err := c.kubeclientset.CoreV1().Pods(pod.Namespace).Get(pod.Name, metav1.GetOptions{})
 		if err != nil && errors.IsNotFound(err) {
-			found, err = c.kubeClientset.CoreV1().Pods(pod.Namespace).Create(pod)
+			found, err = c.kubeclientset.CoreV1().Pods(pod.Namespace).Create(pod)
 			if err != nil {
 				return time.Duration(0), err
 			}

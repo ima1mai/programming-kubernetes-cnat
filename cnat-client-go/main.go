@@ -18,18 +18,21 @@ package main
 
 import (
 	"flag"
+	"os"
+	"path/filepath"
 	"time"
 
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
+
 	// Uncomment the following line to load the gcp plugin (only required to authenticate against GKE clusters).
 	// _ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 
-	clientset "k8s.io/sample-controller/pkg/generated/clientset/versioned"
-	informers "k8s.io/sample-controller/pkg/generated/informers/externalversions"
-	"k8s.io/sample-controller/pkg/signals"
+	clientset "github.com/ima1mai/programming-kubernetes-cnat/cnat-client-go/pkg/generated/clientset/versioned"
+	informers "github.com/ima1mai/programming-kubernetes-cnat/cnat-client-go/pkg/generated/informers/externalversions"
+	"github.com/ima1mai/programming-kubernetes-cnat/cnat-client-go/pkg/signals"
 )
 
 var (
@@ -38,7 +41,11 @@ var (
 )
 
 func main() {
+	flag.StringVar(&kubeconfig, "kubeconfig", defaultKubeconfig(), "Path to a kubeconfig. Only required if out-of-cluster.")
+	flag.StringVar(&masterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
+
 	klog.InitFlags(nil)
+
 	flag.Parse()
 
 	// set up signals so we handle the first shutdown signal gracefully
@@ -54,29 +61,37 @@ func main() {
 		klog.Fatalf("Error building kubernetes clientset: %s", err.Error())
 	}
 
-	exampleClient, err := clientset.NewForConfig(cfg)
+	cnatClient, err := clientset.NewForConfig(cfg)
 	if err != nil {
 		klog.Fatalf("Error building example clientset: %s", err.Error())
 	}
 
 	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
-	exampleInformerFactory := informers.NewSharedInformerFactory(exampleClient, time.Second*30)
+	cnatInformerFactory := informers.NewSharedInformerFactory(cnatClient, time.Second*30)
 
-	controller := NewController(kubeClient, exampleClient,
-		kubeInformerFactory.Apps().V1().Deployments(),
-		exampleInformerFactory.Samplecontroller().V1alpha1().Foos())
+	controller := NewController(kubeClient, cnatClient,
+		cnatInformerFactory.Cnat().V1alpha1().Ats(),
+		kubeInformerFactory.Core().V1().Pods())
 
 	// notice that there is no need to run Start methods in a separate goroutine. (i.e. go kubeInformerFactory.Start(stopCh)
 	// Start method is non-blocking and runs all registered informers in a dedicated goroutine.
 	kubeInformerFactory.Start(stopCh)
-	exampleInformerFactory.Start(stopCh)
+	cnatInformerFactory.Start(stopCh)
 
 	if err = controller.Run(2, stopCh); err != nil {
 		klog.Fatalf("Error running controller: %s", err.Error())
 	}
 }
 
-func init() {
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
-	flag.StringVar(&masterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
+func defaultKubeconfig() string {
+	fname := os.Getenv("KUBECONFIG")
+	if fname != "" {
+		return fname
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		klog.Warningf("failed to get home directory: %v", err)
+		return ""
+	}
+	return filepath.Join(home, ".kube", "config")
 }
