@@ -17,11 +17,11 @@ limitations under the License.
 package main
 
 import (
-	"context"
 	"fmt"
+	"reflect"
+	"strings"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,16 +31,17 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	corev1lister "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog"
 
-	samplev1alpha1 "k8s.io/sample-controller/pkg/apis/samplecontroller/v1alpha1"
-	clientset "k8s.io/sample-controller/pkg/generated/clientset/versioned"
-	samplescheme "k8s.io/sample-controller/pkg/generated/clientset/versioned/scheme"
-	informers "k8s.io/sample-controller/pkg/generated/informers/externalversions/samplecontroller/v1alpha1"
-	listers "k8s.io/sample-controller/pkg/generated/listers/cnat/v1alpha1"
+	cnatv1alpha1 "github.com/ima1mai/programming-kubernetes-cnat/cnat-client-go/pkg/apis/cnat/v1alpha1"
+	clientset "github.com/ima1mai/programming-kubernetes-cnat/cnat-client-go/pkg/generated/clientset/versioned"
+	cnatscheme "github.com/ima1mai/programming-kubernetes-cnat/cnat-client-go/pkg/generated/clientset/versioned/scheme"
+	informers "github.com/ima1mai/programming-kubernetes-cnat/cnat-client-go/pkg/generated/informers/externalversions/cnat/v1alpha1"
+	listers "github.com/ima1mai/programming-kubernetes-cnat/cnat-client-go/pkg/generated/listers/cnat/v1alpha1"
 )
 
 const controllerAgentName = "sample-controller"
@@ -69,7 +70,7 @@ type Controller struct {
 
 	atLister   listers.AtLister
 	atsSynced  cache.InformerSynced
-	podLister  corev1lister.podLister
+	podLister  corev1lister.PodLister
 	podsSynced cache.InformerSynced
 
 	// workqueue is a rate limited work queue. This is used to queue work to be
@@ -93,7 +94,7 @@ func NewController(
 	// Create event broadcaster
 	// Add sample-controller types to the default Kubernetes Scheme so Events can be
 	// logged for sample-controller types.
-	utilruntime.Must(samplescheme.AddToScheme(scheme.Scheme))
+	utilruntime.Must(cnatscheme.AddToScheme(scheme.Scheme))
 	klog.V(4).Info("Creating event broadcaster")
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(klog.Infof)
@@ -138,11 +139,14 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 	defer c.workqueue.ShutDown()
 
 	// Start the informer factories to begin populating the informer caches
-	klog.Info("Starting Foo controller")
+	klog.Info("Starting cnat client-go controller")
 
 	// Wait for the caches to be synced before starting workers
 	klog.Info("Waiting for informer caches to sync")
-	if ok := cache.WaitForCacheSync(stopCh, c.deploymentsSynced, c.foosSynced); !ok {
+	if ok := cache.WaitForCacheSync(stopCh, c.atsSynced); !ok {
+		return fmt.Errorf("failed to wait for caches to sync")
+	}
+	if ok := cache.WaitForCacheSync(stopCh, c.podsSynced); !ok {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
@@ -229,7 +233,7 @@ func (c *Controller) processNextWorkItem() bool {
 // converge the two. It then updates the Status block of the Foo resource
 // with the current status of the resource.
 func (c *Controller) syncHandler(key string) (time.Duration, error) {
-	klog.Info("=== Reconcilint At %s", key)
+	klog.Info("=== Reconciling At %s", key)
 
 	// Convert the namespace/name string into a distinct namespace and name
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
@@ -239,87 +243,93 @@ func (c *Controller) syncHandler(key string) (time.Duration, error) {
 	}
 
 	// Get the At resource with this namespace/name
-	foo, err := c.atLister.Ats(namespace).Get(name)
+	original, err := c.atLister.Ats(namespace).Get(name)
 	if err != nil {
 		// The Foo resource may no longer exist, in which case we stop
 		// processing.
 		if errors.IsNotFound(err) {
 			utilruntime.HandleError(fmt.Errorf("foo '%s' in work queue no longer exists", key))
-			return nil
+			return time.Duration(0), nil
 		}
 
-		return err
+		return time.Duration(0), err
 	}
 
-	deploymentName := foo.Spec.DeploymentName
-	if deploymentName == "" {
-		// We choose to absorb the error here as the worker would requeue the
-		// resource otherwise. Instead, the next time the resource is updated
-		// the resource will be queued again.
-		utilruntime.HandleError(fmt.Errorf("%s: deployment name must be specified", key))
-		return nil
+	// Clone because the original object is owned by the lister
+	instance := original.DeepCopy()
+
+	// If no phase set, default to pending (the initial phase)
+	if instance.Status.Phase == "" {
+		instance.Status.Phase = cnatv1alpha1.PhasePending
 	}
 
-	// Get the deployment with the name specified in Foo.spec
-	deployment, err := c.deploymentsLister.Deployments(foo.Namespace).Get(deploymentName)
-	// If the resource doesn't exist, we'll create it
-	if errors.IsNotFound(err) {
-		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Create(context.TODO(), newDeployment(foo), metav1.CreateOptions{})
+	// Now let's make the main case distinction: implmenting
+	// the state diagram PENDING -> RUNNING -> DONE
+	switch instance.Status.Phase {
+	case cnatv1alpha1.PhasePending:
+		klog.Infof("instance %s: phase=PENDING", key)
+		// As long as we havne't executed the command yet, we need to check if it's time alreaddy to act:
+		klog.Infof("instance %s: checking schedule %q", key, instance.Spec.Schedule)
+		// Check if it's already time to execute the command with a tolerance of 2 seconds:
+		d, err := timeUntilSchedule(instance.Spec.Schedule)
+		if err != nil {
+			utilruntime.HandleError(fmt.Errorf("schedule parsing failed: %v", err))
+			return time.Duration(0), err
+		}
+		klog.Infof("instance %s: schedule parsing done: diff=%v", key, d)
+		if d > 0 {
+			// Not yet time to execute the command, wait until the scheduled time
+			return d, nil
+		}
+
+		klog.Info("instance %s: it's time! Ready to execute: %s", key, instance.Spec.Command)
+		instance.Status.Phase = cnatv1alpha1.PhaseRunning
+	case cnatv1alpha1.PhaseRunning:
+		klog.Infof("instance %s, Phase: Running", key)
+
+		pod := newPodForCR(instance)
+
+		// Set At instance as the owner and controller
+		owner := metav1.NewControllerRef(instance, cnatv1alpha1.SchemeGroupVersion.WithKind("At"))
+		pod.ObjectMeta.OwnerReferences = append(pod.ObjectMeta.OwnerReferences, *owner)
+
+		// Try to see if the pod already exists and if not
+		// (which we expect) then create a one-shot pod as per spec:
+		found, err := c.kubeClientset.CoreV1.Pods(pod.Namespace).Get(pod.Name, metav1.GetOptions{})
+		if err != nil && errors.IsNotFound(err) {
+			found, err = c.kubeClientset.CoreV1().Pods(pod.Namespace).Create(pod)
+			if err != nil {
+				return time.Duration(0), err
+			}
+			klog.Infof("instance %s: pod launched: name=%s", key, pod.Name)
+		} else if err != nil {
+			// requeue with error
+			return time.Duration(0), err
+		} else if found.Status.Phase == corev1.PodFailed || found.Status.Phase == corev1.PodSucceeded {
+			klog.Infof("instance %s: container terminated: reason=%q message=%q", key, found.Status.Reason, found.Status.Message)
+			instance.Status.Phase = cnatv1alpha1.PhaseDone
+		} else {
+			// don't requeue because it will happen automatically when the pod status changes
+			return time.Duration(0), nil
+		}
+	case cnatv1alpha1.PhaseDone:
+		klog.Infof("instance %s: phase: Done", key)
+		return time.Duration(0), nil
+	default:
+		klog.Infof("instance %s: NOP", key)
+		return time.Duration(0), nil
 	}
 
-	// If an error occurs during Get/Create, we'll requeue the item so we can
-	// attempt processing again later. This could have been caused by a
-	// temporary network failure, or any other transient reason.
-	if err != nil {
-		return err
+	if !reflect.DeepEqual(original, instance) {
+		// Update the At instance, setting the status to the respective phase:
+		_, err = c.cnatClientset.CnatV1alpha1().Ats(instance.Namespace).UpdateStatus(instance)
+		if err != nil {
+			return time.Duration(0), err
+		}
 	}
 
-	// If the Deployment is not controlled by this Foo resource, we should log
-	// a warning to the event recorder and return error msg.
-	if !metav1.IsControlledBy(deployment, foo) {
-		msg := fmt.Sprintf(MessageResourceExists, deployment.Name)
-		c.recorder.Event(foo, corev1.EventTypeWarning, ErrResourceExists, msg)
-		return fmt.Errorf(msg)
-	}
-
-	// If this number of the replicas on the Foo resource is specified, and the
-	// number does not equal the current desired replicas on the Deployment, we
-	// should update the Deployment resource.
-	if foo.Spec.Replicas != nil && *foo.Spec.Replicas != *deployment.Spec.Replicas {
-		klog.V(4).Infof("Foo %s replicas: %d, deployment replicas: %d", name, *foo.Spec.Replicas, *deployment.Spec.Replicas)
-		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Update(context.TODO(), newDeployment(foo), metav1.UpdateOptions{})
-	}
-
-	// If an error occurs during Update, we'll requeue the item so we can
-	// attempt processing again later. This could have been caused by a
-	// temporary network failure, or any other transient reason.
-	if err != nil {
-		return err
-	}
-
-	// Finally, we update the status block of the Foo resource to reflect the
-	// current state of the world
-	err = c.updateFooStatus(foo, deployment)
-	if err != nil {
-		return err
-	}
-
-	c.recorder.Event(foo, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
-	return nil
-}
-
-func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1.Deployment) error {
-	// NEVER modify objects from the store. It's a read-only, local cache.
-	// You can use DeepCopy() to make a deep copy of original object and modify this copy
-	// Or create a copy manually for better performance
-	fooCopy := foo.DeepCopy()
-	fooCopy.Status.AvailableReplicas = deployment.Status.AvailableReplicas
-	// If the CustomResourceSubresources feature gate is not enabled,
-	// we must use Update instead of UpdateStatus to update the Status block of the Foo resource.
-	// UpdateStatus will not allow changes to the Spec of the resource,
-	// which is ideal for ensuring nothing other than resource status has been updated.
-	_, err := c.sampleclientset.SamplecontrollerV1alpha1().Foos(foo.Namespace).Update(context.TODO(), fooCopy, metav1.UpdateOptions{})
-	return err
+	// Don't requeue. We should be reconcile because either the pod or the CR changes.
+	return time.Duration(0), nil
 }
 
 // enqueueFoo takes a Foo resource and converts it into a namespace/name
@@ -335,80 +345,81 @@ func (c *Controller) enqueueFoo(obj interface{}) {
 	c.workqueue.Add(key)
 }
 
-// handleObject will take any resource implementing metav1.Object and attempt
-// to find the Foo resource that 'owns' it. It does this by looking at the
-// objects metadata.ownerReferences field for an appropriate OwnerReference.
-// It then enqueues that Foo resource to be processed. If the object does not
-// have an appropriate OwnerReference, it will simply be skipped.
-func (c *Controller) handleObject(obj interface{}) {
-	var object metav1.Object
+func (c *Controller) enqueueAt(obj interface{}) {
+	var key string
+	var err error
+	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+	c.workqueue.Add(key)
+}
+
+// enqueueAt a pod and checks that the owner reference points to an At object. It then
+// enqueues this At object.
+func (c *Controller) enqueuePod(obj interface{}) {
+	var pod *corev1.Pod
 	var ok bool
-	if object, ok = obj.(metav1.Object); !ok {
+	if pod, ok = obj.(*corev1.Pod); !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
-			utilruntime.HandleError(fmt.Errorf("error decoding object, invalid type"))
+			utilruntime.HandleError(fmt.Errorf("error decoding pod, invalid type"))
 			return
 		}
-		object, ok = tombstone.Obj.(metav1.Object)
+		pod, ok = tombstone.Obj.(*corev1.Pod)
 		if !ok {
-			utilruntime.HandleError(fmt.Errorf("error decoding object tombstone, invalid type"))
+			utilruntime.HandleError(fmt.Errorf("error decoding pod tombstone, invalid type"))
 			return
 		}
-		klog.V(4).Infof("Recovered deleted object '%s' from tombstone", object.GetName())
+		klog.V(4).Infof("Recovered deleted pod '%s' from tombstone", pod.GetName())
 	}
-	klog.V(4).Infof("Processing object: %s", object.GetName())
-	if ownerRef := metav1.GetControllerOf(object); ownerRef != nil {
-		// If this object is not owned by a Foo, we should not do anything more
-		// with it.
-		if ownerRef.Kind != "Foo" {
+	if ownerRef := metav1.GetControllerOf(pod); ownerRef != nil {
+		if ownerRef.Kind != "At" {
 			return
 		}
 
-		foo, err := c.foosLister.Foos(object.GetNamespace()).Get(ownerRef.Name)
+		at, err := c.atLister.Ats(pod.GetNamespace()).Get(ownerRef.Name)
 		if err != nil {
-			klog.V(4).Infof("ignoring orphaned object '%s' of foo '%s'", object.GetSelfLink(), ownerRef.Name)
+			klog.V(4).Infof("ignoring orphaned pod '%s' of At '%s'", pod.GetSelfLink(), ownerRef.Name)
 			return
 		}
 
-		c.enqueueFoo(foo)
-		return
+		klog.Infof("enqueuing At %s/%s because pod changed", at.Namespace, at.Name)
+		c.enqueueAt(at)
 	}
 }
 
-// newDeployment creates a new Deployment for a Foo resource. It also sets
-// the appropriate OwnerReferences on the resource so handleObject can discover
-// the Foo resource that 'owns' it.
-func newDeployment(foo *samplev1alpha1.Foo) *appsv1.Deployment {
+func newPodForCR(cr *cnatv1alpha1.At) *corev1.Pod {
 	labels := map[string]string{
-		"app":        "nginx",
-		"controller": foo.Name,
+		"app": cr.Name,
 	}
-	return &appsv1.Deployment{
+	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      foo.Spec.DeploymentName,
-			Namespace: foo.Namespace,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(foo, samplev1alpha1.SchemeGroupVersion.WithKind("Foo")),
-			},
+			Name:      cr.Name + "-pod",
+			Namespace: cr.Namespace,
+			Labels:    labels,
 		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: foo.Spec.Replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:  "nginx",
-							Image: "nginx:latest",
-						},
-					},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:    "busybox",
+					Image:   "busybox",
+					Command: strings.Split(cr.Spec.Command, ""),
 				},
 			},
+			RestartPolicy: corev1.RestartPolicyOnFailure,
 		},
 	}
+}
+
+// timeUntilSchedule parses schedule and returns the time until the schedule.
+// When it is overdue, the duration is negative.
+func timeUntilSchedule(schedule string) (time.Duration, error) {
+	now := time.Now().UTC()
+	layout := "2016-01-02T15:04:05Z"
+	s, err := time.Parse(layout, schedule)
+	if err != nil {
+		return time.Duration(0), err
+	}
+	return s.Sub(now), nil
 }
