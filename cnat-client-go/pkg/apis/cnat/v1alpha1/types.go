@@ -60,7 +60,7 @@ type At struct {
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
-// AtList is a list of Foo resources
+// AtList is a list of At resources
 type AtList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata"`

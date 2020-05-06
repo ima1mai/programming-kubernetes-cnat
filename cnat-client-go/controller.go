@@ -47,21 +47,21 @@ import (
 const controllerAgentName = "sample-controller"
 
 const (
-	// SuccessSynced is used as part of the Event 'reason' when a Foo is synced
+	// SuccessSynced is used as part of the Event 'reason' when a At is synced
 	SuccessSynced = "Synced"
-	// ErrResourceExists is used as part of the Event 'reason' when a Foo fails
+	// ErrResourceExists is used as part of the Event 'reason' when a At fails
 	// to sync due to a Deployment of the same name already existing.
 	ErrResourceExists = "ErrResourceExists"
 
 	// MessageResourceExists is the message used for Events when a resource
 	// fails to sync due to a Deployment already existing
-	MessageResourceExists = "Resource %q already exists and is not managed by Foo"
-	// MessageResourceSynced is the message used for an Event fired when a Foo
+	MessageResourceExists = "Resource %q already exists and is not managed by At"
+	// MessageResourceSynced is the message used for an Event fired when a At
 	// is synced successfully
-	MessageResourceSynced = "Foo synced successfully"
+	MessageResourceSynced = "At synced successfully"
 )
 
-// Controller is the controller implementation for Foo resources
+// Controller is the controller implementation for At resources
 type Controller struct {
 	// kubeclientset is a standard kubernetes clientset
 	kubeclientset kubernetes.Interface
@@ -108,13 +108,13 @@ func NewController(
 		atsSynced:     atInformer.Informer().HasSynced,
 		podLister:     podInformer.Lister(),
 		podsSynced:    podInformer.Informer().HasSynced,
-		workqueue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Foos"),
+		workqueue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Ats"),
 		recorder:      recorder,
 	}
 
 	klog.Info("Setting up event handlers")
-	// Set up an event handler for when Foo resources change
-	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	// Set up an event handler for when At resources change
+	atInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.enqueueAt,
 		UpdateFunc: func(old, new interface{}) {
 			controller.enqueueAt(new)
@@ -151,7 +151,7 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 	}
 
 	klog.Info("Starting workers")
-	// Launch two workers to process Foo resources
+	// Launch two workers to process At resources
 	for i := 0; i < threadiness; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
 	}
@@ -205,7 +205,7 @@ func (c *Controller) processNextWorkItem() bool {
 			return nil
 		}
 		// Run the syncHandler, passing it the namespace/name string of the
-		// Foo resource to be synced.
+		// At resource to be synced.
 		if when, err := c.syncHandler(key); err != nil {
 			// Put the item back on the workqueue to handle any transient errors.
 			c.workqueue.AddRateLimited(key)
@@ -230,7 +230,7 @@ func (c *Controller) processNextWorkItem() bool {
 }
 
 // syncHandler compares the actual state with the desired, and attempts to
-// converge the two. It then updates the Status block of the Foo resource
+// converge the two. It then updates the Status block of the At resource
 // with the current status of the resource.
 func (c *Controller) syncHandler(key string) (time.Duration, error) {
 	klog.Info("=== Reconciling At %s", key)
@@ -245,10 +245,10 @@ func (c *Controller) syncHandler(key string) (time.Duration, error) {
 	// Get the At resource with this namespace/name
 	original, err := c.atLister.Ats(namespace).Get(name)
 	if err != nil {
-		// The Foo resource may no longer exist, in which case we stop
+		// The At resource may no longer exist, in which case we stop
 		// processing.
 		if errors.IsNotFound(err) {
-			utilruntime.HandleError(fmt.Errorf("foo '%s' in work queue no longer exists", key))
+			utilruntime.HandleError(fmt.Errorf("At '%s' in work queue no longer exists", key))
 			return time.Duration(0), nil
 		}
 
@@ -321,28 +321,17 @@ func (c *Controller) syncHandler(key string) (time.Duration, error) {
 	}
 
 	if !reflect.DeepEqual(original, instance) {
+		klog.Infof("instance %s: updating status to %s", key, instance.Status.Phase)
 		// Update the At instance, setting the status to the respective phase:
 		_, err = c.cnatClientset.CnatV1alpha1().Ats(instance.Namespace).UpdateStatus(instance)
 		if err != nil {
 			return time.Duration(0), err
 		}
+		klog.Infof("instance %s: updating status done", key)
 	}
 
 	// Don't requeue. We should be reconcile because either the pod or the CR changes.
 	return time.Duration(0), nil
-}
-
-// enqueueFoo takes a Foo resource and converts it into a namespace/name
-// string which is then put onto the work queue. This method should *not* be
-// passed resources of any type other than Foo.
-func (c *Controller) enqueueFoo(obj interface{}) {
-	var key string
-	var err error
-	if key, err = cache.MetaNamespaceKeyFunc(obj); err != nil {
-		utilruntime.HandleError(err)
-		return
-	}
-	c.workqueue.Add(key)
 }
 
 func (c *Controller) enqueueAt(obj interface{}) {
@@ -404,7 +393,7 @@ func newPodForCR(cr *cnatv1alpha1.At) *corev1.Pod {
 				{
 					Name:    "busybox",
 					Image:   "busybox",
-					Command: strings.Split(cr.Spec.Command, ""),
+					Command: strings.Split(cr.Spec.Command, " "),
 				},
 			},
 			RestartPolicy: corev1.RestartPolicyOnFailure,
@@ -416,7 +405,7 @@ func newPodForCR(cr *cnatv1alpha1.At) *corev1.Pod {
 // When it is overdue, the duration is negative.
 func timeUntilSchedule(schedule string) (time.Duration, error) {
 	now := time.Now().UTC()
-	layout := "2016-01-02T15:04:05Z"
+	layout := "2006-01-02T15:04:05Z"
 	s, err := time.Parse(layout, schedule)
 	if err != nil {
 		return time.Duration(0), err
